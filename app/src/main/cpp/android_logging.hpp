@@ -1,0 +1,8 @@
+//
+// Created by Eric Berdahl on 2019-05-01.
+//
+
+#ifndef MEDIATEST_ANDROID_LOGGING_HPP
+#define MEDIATEST_ANDROID_LOGGING_HPP
+
+#endif //MEDIATEST_ANDROID_LOGGING_HPP
