@@ -6,29 +6,20 @@
 
 /* ============================================================================================== */
 
+void imageAvailable(sample::decoder& decoder, AImage* image)
+{
+
+}
+
 int sample_main(int argc, char *argv[])
 {
     try
     {
-        sample::app info;
-
-        info.openMedia("/data/local/tmp/file1.mp4");
-        info.startImageReader();
-
-        bool inputEOSObserved = false;
-        bool outputEOSObserved = false;
-        while (!inputEOSObserved  || !outputEOSObserved)
+        sample::decoder decoder("/data/local/tmp/file1.mp4", &imageAvailable);
+        decoder.start();
+        while (!decoder.isDone())
         {
-            if (!inputEOSObserved)
-            {
-                inputEOSObserved = info.advanceDecodeInput();
-                LOGI("advanceDecodeInput: %s", !inputEOSObserved ? "more-data" : "at-EOS");
-            }
-            if (!outputEOSObserved)
-            {
-                outputEOSObserved = info.advanceDecodeOutput();
-                LOGI("advanceDecodeOutput: %s", !outputEOSObserved ? "more-data" : "at-EOS");
-            }
+            // this space intentionally left blank
         }
     }
     catch (...)
