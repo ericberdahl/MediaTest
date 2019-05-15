@@ -37,6 +37,7 @@ set(CMAKE_SHARED_LINKER_FLAGS
 add_library(native-activity SHARED
         media_test.cpp
         sample_app.cpp
+        StopWatch.cpp
         util.cpp
         )
 

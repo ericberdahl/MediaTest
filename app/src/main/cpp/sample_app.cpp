@@ -8,108 +8,54 @@
 
 #include <boost/exception/all.hpp>
 
+#include <algorithm>
 #include <cassert>
 #include <cstdint>
-#include <fcntl.h>
-#include <unistd.h>
 
 namespace {
-    struct sample_error: virtual boost::exception, virtual std::exception { };
+    using namespace sample;
 
+    std::shared_ptr<AMediaCodec> createMediaCodec(AMediaFormat* format, ANativeWindow* window)
+    {
+        const char* mime = nullptr;
+        if (!AMediaFormat_getString(format, AMEDIAFORMAT_KEY_MIME, &mime))
+        {
+            BOOST_THROW_EXCEPTION( sample_error()
+                                           << boost::errinfo_api_function("AMediaFormat_getString(AMEDIAFORMAT_KEY_MIME)") );
+        }
+
+        std::shared_ptr<AMediaCodec> result(AMediaCodec_createDecoderByType(mime), AMediaCodec_delete);
+        if (!result)
+        {
+            BOOST_THROW_EXCEPTION( sample_error()
+                                           << boost::errinfo_api_function("AMediaCodec_createDecoderByType") );
+        }
+
+        fail_media_error(AMediaCodec_configure(result.get(),
+                                               format,
+                                               window,
+                                               nullptr, // AMediaCrypto
+                                               0), // flags
+                         "AMediaCodec_configure");
+
+        return result;
+    }
+}
+
+namespace sample {
 
     void fail_media_error(media_status_t status, const char* apiFunction)
     {
         if (status != AMEDIA_OK)
         {
             BOOST_THROW_EXCEPTION( sample_error()
-                                        << boost::errinfo_api_function(apiFunction)
-                                        << sample::errinfo_media_status(status) );
-        }
-    }
-}
-
-namespace sample {
-
-    decoder::decoder()
-            : mAtInputEOS(false),
-              mAtOutputEOS(false)
-    {
-        // this space intentionally left blank
-    }
-
-    decoder::decoder(const std::string& mediaFilePath,
-                     imageAvailable_t imageAvailableFn)
-            : decoder()
-    {
-        mImageAvailableFn = imageAvailableFn;
-
-        // TODO mMediaFd will leak if an exception is thrown in the constructor
-        mMediaFd = open(mediaFilePath.c_str(), O_RDONLY | O_CLOEXEC);
-        if (mMediaFd < 0)
-        {
-            BOOST_THROW_EXCEPTION( sample_error()
-                                           << boost::errinfo_api_function("open")
-                                           << boost::errinfo_errno(errno)
-                                           << boost::errinfo_file_name(mediaFilePath) );
-        }
-
-        mMediaExtractor.reset(AMediaExtractor_new(), AMediaExtractor_delete);
-        if (!mMediaExtractor)
-        {
-            BOOST_THROW_EXCEPTION( sample_error()
-                                           << boost::errinfo_api_function("AMediaExtractor_new") );
-        }
-
-        const off64_t mediaSize = lseek64(mMediaFd, 0, SEEK_END);
-        lseek64(mMediaFd, 0, SEEK_SET);
-        fail_media_error(
-                AMediaExtractor_setDataSourceFd(mMediaExtractor.get(), mMediaFd, 0, mediaSize),
-                "AMediaExtractor_setDataSourceFd");
-
-        LOGI("%s path:'%s' mediaSize:%jd", __FUNCTION__, mediaFilePath.c_str(), mediaSize);
-
-        const auto format = selectVideoTrack();
-
-        createImageReader(format.get());
-        assert(mImageReader);
-
-        createMediaCodec(format.get());
-        assert(mMediaCodec);
-    }
-
-    decoder::~decoder()
-    {
-        if (mIOPollingThread.joinable())
-        {
-            mIOPollingThread.join();
-        }
-
-        if (mMediaCodec)
-        {
-            (void) AMediaCodec_stop(mMediaCodec.get());
-        }
-
-        if (mMediaFd > 0)
-        {
-            close(mMediaFd);
-            mMediaFd = -1;
+                                           << boost::errinfo_api_function(apiFunction)
+                                           << sample::errinfo_media_status(status) );
         }
     }
 
-    void decoder::start()
+    std::shared_ptr<AImageReader> createImageReader(AMediaFormat* format)
     {
-        assert(mMediaCodec);
-
-        fail_media_error(AMediaCodec_start(mMediaCodec.get()),
-                         "AMediaCodec_start");
-
-        mIOPollingThread = std::thread(&decoder::ioPollingLoop, this);
-    }
-
-    void decoder::createImageReader(AMediaFormat* format)
-    {
-        assert(format && !mImageReader);
-
         std::int32_t    width = 0;
         std::int32_t    height = 0;
         if (AMediaFormat_getInt32(format, AMEDIAFORMAT_KEY_WIDTH, &width) &&
@@ -128,62 +74,45 @@ namespace sample {
                                                    maxImageCount,
                                                    &imageReader),
                          "AImageReader_newWithUsage");
-        mImageReader.reset(imageReader, AImageReader_delete);
 
-        AImageReader_ImageListener imageListener = { this, &decoder::imageListenerCallback };
-        fail_media_error(AImageReader_setImageListener(mImageReader.get(), &imageListener),
-                         "AImageReader_setImageListener");
+        return std::shared_ptr<AImageReader>(imageReader, AImageReader_delete);
     }
 
-    void decoder::createMediaCodec(AMediaFormat* format)
+    std::shared_ptr<AMediaExtractor> createMediaExtractor(int fd)
     {
-        assert(format && !mMediaCodec && mImageReader);
-
-        const char* mime = nullptr;
-        if (!AMediaFormat_getString(format, AMEDIAFORMAT_KEY_MIME, &mime))
+        std::shared_ptr<AMediaExtractor> result(AMediaExtractor_new(), AMediaExtractor_delete);
+        if (!result)
         {
             BOOST_THROW_EXCEPTION( sample_error()
-                                           << boost::errinfo_api_function("AMediaFormat_getString(AMEDIAFORMAT_KEY_MIME)") );
+                                           << boost::errinfo_api_function("AMediaExtractor_new") );
         }
 
-        mMediaCodec.reset(AMediaCodec_createDecoderByType(mime), AMediaCodec_delete);
-        if (!mMediaCodec)
-        {
-            BOOST_THROW_EXCEPTION( sample_error()
-                                           << boost::errinfo_api_function("AMediaCodec_createDecoderByType") );
-        }
+        const off64_t mediaSize = lseek64(fd, 0, SEEK_END);
+        lseek64(fd, 0, SEEK_SET);
+        fail_media_error(
+                AMediaExtractor_setDataSourceFd(result.get(), fd, 0, mediaSize),
+                "AMediaExtractor_setDataSourceFd");
 
-        ANativeWindow* window = nullptr;
-        fail_media_error(AImageReader_getWindow(mImageReader.get(), &window),
-                         "AImageReader_getWindow");
-
-        fail_media_error(AMediaCodec_configure(mMediaCodec.get(),
-                                               format,
-                                               window,
-                                               nullptr, // AMediaCrypto
-                                               0), // flags
-                         "AMediaCodec_configure");
+        return result;
     }
 
-    std::shared_ptr<AMediaFormat> decoder::selectVideoTrack()
+    std::shared_ptr<AMediaFormat> selectVideoTrack(AMediaExtractor* extractor)
     {
-        assert(mMediaExtractor);
-
         LOGI("%s BEGIN", __FUNCTION__);
 
-        const std::size_t numTracks = AMediaExtractor_getTrackCount(mMediaExtractor.get());
+        const std::size_t numTracks = AMediaExtractor_getTrackCount(extractor);
         LOGI("%s numTracks:%zd", __FUNCTION__, numTracks);
 
         AMediaFormat* result = nullptr;
         for (std::size_t track = 0; track < numTracks; ++track)
         {
-            AMediaFormat* const format = AMediaExtractor_getTrackFormat(mMediaExtractor.get(), track);
+            AMediaFormat* const format = AMediaExtractor_getTrackFormat(extractor, track);
 
             const char* mime = nullptr;
             if (AMediaFormat_getString(format, AMEDIAFORMAT_KEY_MIME, &mime) &&
                 0 == std::strncmp(mime, "video/", 6))
             {
-                AMediaExtractor_selectTrack(mMediaExtractor.get(), track);
+                AMediaExtractor_selectTrack(extractor, track);
                 result = format;
                 LOGI("%s trackNum:%zd format:'%s'", __FUNCTION__, track, AMediaFormat_toString(result));
                 break;
@@ -194,10 +123,77 @@ namespace sample {
         return std::shared_ptr<AMediaFormat>(result, AMediaFormat_delete);
     }
 
-    void decoder::onInputBufferAvailable(AMediaCodec* codec,
-                                         int32_t index)
+    std::tuple<bool, std::size_t, std::uint64_t> readSampleData(AMediaExtractor* extractor,
+                                                                void* buffer,
+                                                                size_t capacity)
     {
-        assert(codec == mMediaCodec.get());
+        const ssize_t bytesRead = AMediaExtractor_readSampleData(extractor,
+                                                                 static_cast<std::uint8_t*>(buffer),
+                                                                 capacity);
+        const std::int64_t presentationTimeUs = AMediaExtractor_getSampleTime(extractor);
+
+        const bool moreDataAvailable = (bytesRead >= 0 && AMediaExtractor_advance(extractor));
+
+        return std::make_tuple(moreDataAvailable,
+                               size_t( std::max(bytesRead, ssize_t(0)) ),
+                               std::uint64_t( std::abs( presentationTimeUs ) ));
+    }
+
+    decoder::decoder()
+            : mAtInputEOS(false),
+              mAtOutputEOS(false)
+    {
+        // this space intentionally left blank
+    }
+
+    decoder::decoder(AMediaFormat* format,
+                     readSampleData_t readSampleData,
+                     ANativeWindow* window)
+            : decoder()
+    {
+        mReadSampleDataFn = readSampleData;
+
+        mMediaCodec = createMediaCodec(format, window);
+
+        AMediaCodecOnAsyncNotifyCallback callbacks;
+        callbacks.onAsyncError = &decoder::asyncErrorCallback;
+        callbacks.onAsyncFormatChanged = &decoder::asyncFormatChangedCallback;
+        callbacks.onAsyncInputAvailable= &decoder::asyncInputAvailableCallback;
+        callbacks.onAsyncOutputAvailable = &decoder::asyncOutputAvailableCallback;
+        fail_media_error(AMediaCodec_setAsyncNotifyCallback(mMediaCodec.get(), callbacks, this),
+                         "AMediaCodec_setAsyncNotifyCallback");
+    }
+
+    decoder::~decoder()
+    {
+        assert(isDone());
+
+        if (mIOThread.joinable())
+        {
+            mIOThread.join();
+        }
+
+        if (mMediaCodec)
+        {
+            (void) AMediaCodec_stop(mMediaCodec.get());
+        }
+    }
+
+    void decoder::start()
+    {
+        assert(mMediaCodec);
+
+        mIOThread = std::thread(&decoder::ioThread, this);
+        fail_media_error(AMediaCodec_start(mMediaCodec.get()),
+                         "AMediaCodec_start");
+    }
+
+    void decoder::onInputAvailable(AMediaCodec* codec,
+                                   int32_t index)
+    {
+        assert(codec == mMediaCodec.get() && codec);
+
+        LOGI("%s index:%d", __FUNCTION__, index);
 
         std::size_t     bufferCapacity = 0;
         std::uint8_t*   buffer = AMediaCodec_getInputBuffer(codec,
@@ -210,30 +206,34 @@ namespace sample {
         }
         LOGI("%s bufferCapacity:%zd", __FUNCTION__, bufferCapacity);
 
-        const ssize_t bytesRead = AMediaExtractor_readSampleData(mMediaExtractor.get(),
-                                                                 buffer,
-                                                                 bufferCapacity);
-        const std::int64_t presentationTimeUs = AMediaExtractor_getSampleTime(mMediaExtractor.get());
-        assert(0 <= presentationTimeUs);
-        mAtInputEOS = AMediaExtractor_advance(mMediaExtractor.get());
-        LOGI("%s bytesRead:%zd presentationTimeUs:%" PRId64 "atInputEOS:%s",
+        ssize_t bytesRead = 0;
+        std::int64_t presentationTimeUs = 0;
+        bool moreDataAvailable = true;
+        std::tie(moreDataAvailable, bytesRead, presentationTimeUs) = mReadSampleDataFn(*this,
+                                                                                       buffer,
+                                                                                       bufferCapacity);
+
+        LOGI("%s bytesRead:%zd presentationTimeUs:%" PRId64 " moreData:%s",
              __FUNCTION__,
              bytesRead,
              presentationTimeUs,
-             mAtInputEOS ? "TRUE" : "FALSE");
+             moreDataAvailable ? "TRUE" : "FALSE");
 
         fail_media_error(AMediaCodec_queueInputBuffer(codec,
                                                       index,
                                                       0, // offset
                                                       bytesRead,
                                                       presentationTimeUs,
-                                                      mAtInputEOS ? AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM : 0), // flags
+                                                      moreDataAvailable ? 0
+                                                                        : AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM), // flags
                          "AMediaCodec_queueInputBuffer");
+
+        mAtInputEOS = !moreDataAvailable;
     }
 
-    void decoder::onOutputBufferAvailable(AMediaCodec* codec,
-                                          int32_t index,
-                                          AMediaCodecBufferInfo *bufferInfo)
+    void decoder::onOutputAvailable(AMediaCodec* codec,
+                                    int32_t index,
+                                    AMediaCodecBufferInfo *bufferInfo)
     {
         assert(codec == mMediaCodec.get());
 
@@ -243,75 +243,82 @@ namespace sample {
                          "AMediaCodec_releaseOutputBuffer");
 
         mAtOutputEOS = (0 != (bufferInfo->flags & AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM));
-        LOGI("%s atOutputEOS:%s", __FUNCTION__, mAtOutputEOS ? "TRUE" : "FALSE");
+
+        LOGI("%s index:%d  atOutputEOS:%s count:%u",
+             __FUNCTION__,
+             index,
+             mAtOutputEOS ? "TRUE" : "FALSE",
+             mNumOutputBuffers++);
     }
 
-    void decoder::imageListenerCallback(void* userData, AImageReader* reader)
+    void decoder::onFormatChanged(AMediaCodec *codec,
+                                  AMediaFormat *format)
+    {
+        assert(codec == mMediaCodec.get() && codec && format);
+        LOGE("%s { %s }", __FUNCTION__, AMediaFormat_toString(format));
+    }
+
+    void decoder::onError(AMediaCodec *codec,
+                          media_status_t error,
+                          int32_t actionCode,
+                          const char *detail)
+    {
+        assert(codec == mMediaCodec.get() && codec && detail);
+        LOGE("%s %d %d '%s", __FUNCTION__, error, actionCode, detail);
+    }
+
+    void decoder::ioThread()
+    {
+        while (!isDone())
+        {
+            auto task = mIOQueue.pop();
+            task();
+        }
+    }
+
+    void decoder::asyncInputAvailableCallback(AMediaCodec* codec,
+                                              void* userData,
+                                              int32_t index)
     {
         decoder* const self = static_cast<decoder*>(userData);
 
-        try
-        {
-            AImage *image = nullptr;
-            if (self->mFetchAllImages)
-            {
-                fail_media_error(AImageReader_acquireNextImage(reader, &image),
-                                 "AImageReader_acquireNextImage");
-            }
-            else
-            {
-                fail_media_error(AImageReader_acquireLatestImage(reader, &image),
-                                 "AImageReader_acquireLatestImage");
-            }
-
-            self->mImageAvailableFn(*self, image);
-        }
-        catch (...)
-        {
-            LOGE("%s", boost::current_exception_diagnostic_information().c_str());
-        }
+        self->mIOQueue.push([self, codec, index]() { self->onInputAvailable(codec, index); });
     }
 
-    void decoder::ioPollingLoop()
+    void decoder::asyncOutputAvailableCallback(AMediaCodec* codec,
+                                               void* userData,
+                                               int32_t index,
+                                               AMediaCodecBufferInfo *bufferInfo)
     {
-        assert(mMediaCodec);
+        decoder* const self = static_cast<decoder*>(userData);
 
-        try
-        {
-            while (!isDone())
-            {
-                if (!mAtInputEOS)
-                {
-                    const std::int64_t timeoutUs = 1000;    // 1ms
-                    const ssize_t bufferIndex = AMediaCodec_dequeueInputBuffer(mMediaCodec.get(),
-                                                                               timeoutUs);
-                    LOGI("%s inputBufferIndex:%zd", __FUNCTION__, bufferIndex);
-                    if (bufferIndex >= 0)
-                    {
-                        onInputBufferAvailable(mMediaCodec.get(), bufferIndex);
-                    }
-                }
+        AMediaCodecBufferInfo bufferInfoCopy = *bufferInfo;
 
-                if (!mAtOutputEOS)
-                {
-                    AMediaCodecBufferInfo bufferInfo = {};
-                    const std::int64_t timeoutUs = 1000;    // 1ms
-                    const ssize_t bufferIndex = AMediaCodec_dequeueOutputBuffer(mMediaCodec.get(),
-                                                                                &bufferInfo,
-                                                                                timeoutUs);
-                    LOGI("%s outputBufferIndex:%zd", __FUNCTION__, bufferIndex);
-                    if (bufferIndex >= 0)
-                    {
-                        onOutputBufferAvailable(mMediaCodec.get(),
-                                                static_cast<int32_t>(bufferIndex),
-                                                &bufferInfo);
-                    }
-                }
-            }
-        }
-        catch(...)
-        {
-            LOGE("%s", boost::current_exception_diagnostic_information().c_str());
-        }
+        self->mIOQueue.push([self, codec, index, bufferInfoCopy]() {
+            AMediaCodecBufferInfo bc = bufferInfoCopy;
+            self->onOutputAvailable(codec, index, &bc);
+        });
+    }
+
+    void decoder::asyncFormatChangedCallback(AMediaCodec *codec,
+                                             void* userData,
+                                             AMediaFormat *format)
+    {
+        decoder* const self = static_cast<decoder*>(userData);
+
+        self->mIOQueue.push([self, codec, format]() { self->onFormatChanged(codec, format); });
+    }
+
+    void decoder::asyncErrorCallback(AMediaCodec *codec,
+                                     void* userData,
+                                     media_status_t error,
+                                     int32_t actionCode,
+                                     const char *detail)
+    {
+        decoder* const self = static_cast<decoder*>(userData);
+
+        self->mIOQueue.push([self, codec, error, actionCode, detail]() {
+            self->onError(codec, error, actionCode, detail);
+        });
     }
 }

@@ -15,12 +15,12 @@ if(!ndkDir || ndkDir.empty) {
 }
 
 android {
-    compileSdkVersion = 26
+    compileSdkVersion = 28
 
     defaultConfig {
         applicationId = 'com.adobe.eberdahl.mediatest'
-        minSdkVersion 26
-        targetSdkVersion  26
+        minSdkVersion 28
+        targetSdkVersion  28
         ndk {
             abiFilters 'x86', 'x86_64', 'armeabi-v7a', 'arm64-v8a'
         }
