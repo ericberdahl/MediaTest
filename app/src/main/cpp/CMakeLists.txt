@@ -57,7 +57,11 @@ target_link_libraries(native-activity
 #
 
 set(BOOST_ROOT ${PROJECT_SOURCE_DIR}/third_party/boost)
-set(Boost_INCLUDE_DIRS ${BOOST_ROOT})
+set(Boost_INCLUDE_DIR ${BOOST_ROOT})
+set(Boost_LIBRARY_DIR ${BOOST_ROOT})
+set(Boost_Version 1.70)
+
+find_package(Boost ${Boost_Version} REQUIRED)
 
 target_include_directories(
         native-activity PRIVATE
